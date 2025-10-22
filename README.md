@@ -33,7 +33,7 @@ Clone the repository:
 git clone https://github.com/alanPalma25/TumorNet.git
 cd TumorNet
 pip install e
-``
+```
 
 ## Usage
 
