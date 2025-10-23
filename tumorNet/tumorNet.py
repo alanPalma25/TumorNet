@@ -246,16 +246,20 @@ class NutrientField:
 
 class TumorSimulator:
     def __init__(self,
-                 nx = 100, ny = 100,
+                 nx = 80, ny = 80,
                  neighborhood = 'moore', boundary = 'reflective',
                  dt = 1.0, steps = 240,
                  ps = 0.5, alpha = 0.0, prolif_capacity = 5,
                  mean_cycle = 24.0, sd_cycle = 2.0,
-                 D = 1.0, decay = 0.0, initial_nutrient = 1.0,
+                 diff_constant = 1.0, decay = 0.0, initial_nutrient = 1.0,
                  uptake_nonstem = 0.02, uptake_stem = 0.01,
                  diffusion_substeps = 5, chemotaxis_beta = 3.0,
                  therapy_conf: dict = None,
                  seed: Optional[int] = None):
+
+        # Define the diffusive constant
+        D = diff_constant
+
         if seed is not None:
             random.seed(int(seed)); np.random.seed(int(seed))
         
@@ -286,7 +290,7 @@ class TumorSimulator:
         # storage/visualization
         self.frames = []  # list of numpy arrays (RGB) for gif
         self.time_series = []
-        self.cmap = {'empty':"white",'stem': "green",'non_stem':"yellow"}
+        self.cmap = {'empty':"white",'stem': "limegreen",'non_stem':"coral"}
 
     def initialize(self, init_seed='cluster', seed_coords:Optional[List[Tuple[int,int]]]=None, seed_count:int=1):
         """
@@ -565,7 +569,7 @@ class TumorSimulator:
             # Place the daughter cell in the lattice
             self.lattice.place_cell(dest[0], dest[1], daughter)
 
-    def run(self, start_step = 0, n_steps = None, capture_frames = False, capture_every = 1):
+    def run(self, start_step = 0, n_steps = None, capture_frames = False, capture_every = 1, output_dir:Optional[str]=None):
         """
         Run the simulation for a specified number of steps.
             Inputs:
@@ -576,6 +580,8 @@ class TumorSimulator:
             Outputs:
                 None (updates lattice, nutrient field, time series, and frames in place)
         """
+        self.create_output_dir(output_dir=output_dir)
+
         if n_steps is None: 
             n_steps = self.steps
         
@@ -662,8 +668,9 @@ class TumorSimulator:
         # Add time annotation
         ax.text(0.01, 0.99, f"Time: {step_idx*self.dt:.1f}h", transform=ax.transAxes, va='top', fontsize=8, 
                 bbox=dict(facecolor='white',alpha=0.7,edgecolor='none'))
-        # Add label legend in a text box
-        ax.legend(frameon = True, fontsize = 8, framealpha=0.7)
+        # Add label legend
+        if len(xs_s) + len(xs_n) > 0:
+            ax.legend(frameon = True, fontsize = 8, framealpha=0.7)
         # Add colorbar
         cbar = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
         cbar.set_label('Nutrient', fontsize=8)
@@ -673,17 +680,15 @@ class TumorSimulator:
         # Convert canvas to numpy array
         w,h = fig.canvas.get_width_height()
 
-        # Get the RGB buffer from the figure
-        arr = np.frombuffer(fig.canvas.tostring_rgb(), dtype='uint8').reshape(h,w,3)
+        # memory buffer of the RGBA image (remove the alpha channel)
+        arr = np.frombuffer(fig.canvas.buffer_rgba(), dtype='uint8').reshape(h, w, 4)[..., :3]
         plt.close(fig)
 
         return arr
     
-    def save_time_series_png(self, filename='time_series.png'):
+    def save_time_series_png(self,output_dir = None, filename='time_series.png'):
         """ Save the time series data as a PNG plot."""
-        # Create output directory if it doesn't exist
-        self.create_output_dir()
-        
+
         # Define therapy information
         if self.therapy_on:
             t_start = f"{self.therapy_start:.1f}"
@@ -735,9 +740,9 @@ class TumorSimulator:
         arr = self.get_frame_array(step_idx)
         return Image.fromarray(arr)
 
-    def save_gif(self, filename='tumor.gif', fps=6):
+    def save_gif(self, output_dir=None, filename='tumor.gif', fps=6):
         """ Save the captured frames as a GIF file."""
-        self.create_output_dir()
+
         if not self.frames:
             # lazily generate frames from time_series length
             for s in range(len(self.time_series)):
@@ -753,16 +758,18 @@ class TumorSimulator:
             raise RuntimeError("pandas required for to_dataframe()") from e
         return pd.DataFrame(self.time_series)
 
-    def save_time_series_csv(self, filename='counts.csv'):
+    def save_time_series_csv(self, output_dir=None, filename='counts.csv'):
         """Save the time series data to a CSV file."""
+
         if not self.time_series:
             return
         keys = ["time","total","stem","non_stem","avg_nutrient","min_nutrient","max_nutrient","therapy_active"]
-        with open(filename,'w',newline='') as f:
+        with open(self.output_dir + "/" + filename,'w',newline='') as f:
             writer = csv.DictWriter(f, fieldnames=keys)
             writer.writeheader()
             for row in self.time_series:
                 writer.writerow({k:row.get(k,'') for k in keys})
+        print(f"Time series data saved to '{self.output_dir}/{filename}'")
 
     def reset_frames(self):
         self.frames = []
@@ -770,145 +777,256 @@ class TumorSimulator:
     def reset_time_series(self):
         self.time_series = []
 
-if __name__ == "__main__":
+# Helper function for parsing config values
+def _parse_value(v):
+    v = v.strip()
+    if v.lower() in ('true', 'false'):
+        return v.lower() == 'true'
+    try:
+        if '.' in v:
+            return float(v)
+        return int(v)
+    except ValueError:
+        return v
 
-    # Parsing the code
-    parser = argparse.ArgumentParser(prog='TumorNet', description=''' \
-                                    Tumor Growth Simulator
-                                     ''',
-                                     epilog= 'Authors: Alan I. Palma, Sofia Feijóo'+
-                                     '\nDate: 23 October 2025'
-                                     )
+# Helper function to print header and package information
+def print_header(version):
+    print("""
+▗▄▄▄▖█  ▐▌▄▄▄▄   ▄▄▄   ▄▄▄ ▗▖  ▗▖▗▞▀▚▖   ■  
+  █  ▀▄▄▞▘█ █ █ █   █ █    ▐▛▚▖▐▌▐▛▀▀▘▗▄▟▙▄▖
+  █       █   █ ▀▄▄▄▀ █    ▐▌ ▝▜▌▝▚▄▄▖  ▐▌  
+  █                        ▐▌  ▐▌       ▐▌  
+                                        ▐▌                                                                                                                                                             
+          """)
+    print("TumorNet: A Cellular Automaton Tumor Growth Simulator")
+    print(f"Version: {version}")
+    print("Authors: Alan I. Palma, Sofia Feijóo")
+    print("Date: 23 October 2025")
+    print("")
+
+def print_simulation_parameters(params: dict):
+    for k, v in params.items():
+        if k == 'therapy_on' and v == False:
+            print(f"  {k}: {v}")
+            break
+        print(f"  {k}: {v}")
+    print("")
+
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(
+        prog='TumorNet',
+        description='''Tumor Growth Simulator''',
+        epilog='Authors: Alan I. Palma, Sofia Feijóo\nDate: 23 October 2025'
+    )
     
     # Version 
     parser.add_argument('--version', action='version', version='%(prog)s 1.0.0')
+    parser.add_argument('-v', type=str, default='1.0.0', help='Version number')
 
     # Option for a ini file
-    parser.add_argument('-c', '--config', type=str, default='config.ini', help='Path to configuration file')
+    parser.add_argument('-c', '--config', type=str, default=None, help='Path to configuration file')
 
-    # Initialial conditions
+    # Initial conditions (defaults)
     parser.add_argument('-nx', type=int, default=80, help='Lattice size in x direction')
     parser.add_argument('-ny', type=int, default=80, help='Lattice size in y direction')
-    parser.add_argument('--neighborhood', type=str, default='moore', help='Neighborhood type: moore, von_neumann')
-    parser.add_argument('--boundary', type=str, default='reflective', help='Boundary condition: reflective, periodic')  
-    parser.add_argument('--dt', type=float, default=1.0, help='Time step duration')
-    parser.add_argument('--steps', type=int, default=240, help='Total number of simulation steps')
-    parser.add_argument('--ps', type=float, default=0.5, help='Probability of symmetric stem cell division')
-    parser.add_argument('--alpha', type=float, default=0.0, help='Probability of apoptosis upon division')
-    parser.add_argument('--prolif_capacity', type=int, default=5, help='Proliferation capacity of non-stem cells')
+    parser.add_argument('--neighborhood', type=str, default='moore', help='Neighborhood type')
+    parser.add_argument('--boundary', type=str, default='reflective', help='Boundary condition')
+    parser.add_argument('--dt', type=float, default=1.0, help='Time step')
+    parser.add_argument('--steps', type=int, default=200, help='Number of simulation steps')
+    parser.add_argument('--ps', type=float, default=0.5, help='Probability of survival')
+    parser.add_argument('--alpha', type=float, default=0.0, help='Growth rate')
+    parser.add_argument('--prolif_capacity', type=int, default=5, help='Proliferation capacity')
     parser.add_argument('--mean_cycle', type=float, default=24.0, help='Mean cell cycle duration')
     parser.add_argument('--sd_cycle', type=float, default=2.0, help='Standard deviation of cell cycle duration')
-    parser.add_argument('--D', type=float, default=1.0, help='Nutrient diffusion coefficient')
-    parser.add_argument('--decay', type=float, default=0.0, help='Nutrient decay rate')
+    parser.add_argument('-D', '--diff_constant', type=float, default=1.0, help='Nutrient diffusion coefficient')
+    parser.add_argument('--decay', type=float, default=0.0, help='Decay rate')
     parser.add_argument('--initial_nutrient', type=float, default=1.0, help='Initial nutrient concentration')
     parser.add_argument('--uptake_nonstem', type=float, default=0.02, help='Nutrient uptake rate for non-stem cells')
     parser.add_argument('--uptake_stem', type=float, default=0.01, help='Nutrient uptake rate for stem cells')
-    parser.add_argument('--diffusion_substeps', type=int, default=5, help='Number of substeps for nutrient diffusion')
-    parser.add_argument('--chemotaxis_beta', type=float , default=3.0, help='Chemotaxis sensitivity parameter') 
+    parser.add_argument('--diffusion_substeps', type=int, default=5, help='Number of substeps for diffusion simulation')
+    parser.add_argument('--chemotaxis_beta', type=float, default=3.0, help='Chemotaxis sensitivity')
 
     # Therapy configuration
     parser.add_argument('--therapy_on', type=bool, default=False, help='Enable therapy')
-    parser.add_argument('--therapy_start', type=float, default=0.0, help='Therapy start time')
-    parser.add_argument('--therapy_duration', type=float, default=0.0, help='Therapy duration')
-    parser.add_argument('--therapy_period', type=float, default=0.0, help='Therapy period (0 for continuous)')
-    parser.add_argument('--therapy_kill_prob_nonstem', type=float, default=0.5, help='Kill probability for non-stem cells during therapy')
-    parser.add_argument('--therapy_kill_prob_stem', type=float, default=0.1, help='Kill probability for stem cells during therapy')
-    parser.add_argument('--therapy_reduce_prolif', type=int, default=0, help='Reduction in proliferation capacity for non-stem cells during therapy')
-    parser.add_argument('--therapy_apply_each_step', type=bool, default=True, help='Apply therapy check each step')
+    parser.add_argument('--therapy_start', type=float, default=0.0, help='Start time of therapy')
+    parser.add_argument('--therapy_duration', type=float, default=0.0, help='Duration of therapy')
+    parser.add_argument('--therapy_period', type=float, default=0.0, help='Period of therapy')
+    parser.add_argument('--therapy_kill_prob_nonstem', type=float, default=0.5, help='Kill probability for non-stem cells')
+    parser.add_argument('--therapy_kill_prob_stem', type=float, default=0.1, help='Kill probability for stem cells')
+    parser.add_argument('--therapy_reduce_prolif', type=int, default=0, help='Reduction in proliferation')
+    parser.add_argument('--therapy_apply_each_step', type=bool, default=True, help='Apply therapy each step')
 
-    # Initial seeding strategy
-    parser.add_argument('--init_seed', type=str, default='cluster', help='Initial seeding strategy: single, cluster, random')
-    parser.add_argument('--seed_count', type=int, default=None, help='Number of cells to seed for random initialization')
-    parser.add_argument('--seed_coords', type=str, default=None, help='Specific coordinates for seeding cells (format: (x1,y1),(x2,y2),...)')
+    # Initial seeding
+    parser.add_argument('--init_seed', type=str, default='cluster', help='Initial seeding strategy')
+    parser.add_argument('--seed_count', type=int, default=None, help='Number of seeds to place')
+    parser.add_argument('--seed_coords', type=str, default=None, help='Coordinates for initial seeds')
 
     # Output options
-    parser.add_argument('--save_gif', type=bool, default=True, help='Save GIF of the simulation')
-    parser.add_argument('--save_time_series_png', type=bool, default=True, help='Save time series plot as PNG')
-    parser.add_argument('--save_time_series_csv', type=bool, default=True, help='Save time series data as CSV')
-    parser.add_argument('--output_dir', type=str, default='output', help='Directory to save output files')
-    parser.add_argument('--output_gif', type=str, default='tumor_dynamics.gif', help='Filename for output GIF')
-    parser.add_argument('--output_time_series_png', type=str, default='time_series.png', help='Filename for output time series PNG')
-    parser.add_argument('--output_time_series_csv', type=str, default='counts.csv', help='Filename for output time series CSV')
-    parser.add_argument('--frames_capture_every', type=int, default=1, help='Interval of steps to capture frames for GIF')
-    parser.add_argument('--fps', type=int, default=10, help='Frames per second for output GIF')
+    parser.add_argument('--save_gif', type=bool, default=True, help='Save GIF output')
+    parser.add_argument('--save_time_series_png', type=bool, default=True, help='Save time series as PNG')
+    parser.add_argument('--save_time_series_csv', type=bool, default=True, help='Save time series as CSV')
+    parser.add_argument('--output_dir', type=str, default='output', help='Output directory')
+    parser.add_argument('--output_gif', type=str, default='tumor_dynamics.gif', help='Output GIF file')
+    parser.add_argument('--output_time_series_png', type=str, default='time_series.png', help='Output time series PNG file')
+    parser.add_argument('--output_time_series_csv', type=str, default='counts.csv', help='Output time series CSV file')
+    parser.add_argument('--frames_capture_every', type=int, default=1, help='Frames capture every N steps')
+    parser.add_argument('--fps', type=int, default=10, help='Frames per second for output video')
 
     args = parser.parse_args()
 
+    # Configure file parsing
+    sim_params = {}
+    therapy_conf = {}
+    init_seed = {}
+    output_params = {}
+    
 
-
-    if args.config:
-        # Load configuration
+    if args.config and os.path.exists(args.config):
+        mess = f"Loading configuration from '{args.config}'"
         config = configparser.ConfigParser()
         config.read(args.config)
 
         # Simulation parameters
-        sim_params = {}
-        for k,v in config['SIMULATION'].items():
-            try:
-                sim_params[k] = int(v)
-            except ValueError:
-                try:
-                    sim_params[k] = float(v)
-                except ValueError:
-                    sim_params[k] = v
+        if 'SIMULATION' in config:
+            for k, v in config['SIMULATION'].items():
+                sim_params[k] = _parse_value(v)
 
-        for k, v in sim_params.items():
-            print(f"{k}: {v}")
+        # Therapy configuration
+        if 'THERAPY' in config:
+            for k, v in config['THERAPY'].items():
+                therapy_conf[k] = _parse_value(v)
 
-        # Therapy parameters
-        therapy_conf = {}
-        for k,v in config['THERAPY'].items():
-            if v.lower() in ('true','false'):
-                therapy_conf[k] = v.lower() == 'true'
-            else:
-                try:
-                    therapy_conf[k] = int(v)
-                except ValueError:
-                    try:
-                        therapy_conf[k] = float(v)
-                    except ValueError:
-                        therapy_conf[k] = v
-        # Initial condition
-        init_seed = config['INIT_SEED'].get('init_seed', 'single')
+        # Initial seeding
+        if 'INIT_SEED' in config:
+            for k, v in config['INIT_SEED'].items():
+                init_seed[k] = _parse_value(v)
 
-        # Output parameters
-        output_params = {}
-        for k,v in config['OUTPUT'].items():
-            if v.lower() in ('true','false'):
-                output_params[k] = v.lower() == 'true'
-            else:
-                try:
-                    output_params[k] = int(v)
-                except ValueError:
-                    try:
-                        output_params[k] = float(v)
-                    except ValueError:
-                        output_params[k] = v
+        # Output options
+        if 'OUTPUT' in config:
+            for k, v in config['OUTPUT'].items():
+                output_params[k] = _parse_value(v)
 
-        for k, v in output_params.items():
-            print(f"{k}: {v}")
+    # Fallback defaults if no config provided
+    sim_params.setdefault('nx', args.nx)
+    sim_params.setdefault('ny', args.ny)
+    sim_params.setdefault('neighborhood', args.neighborhood)
+    sim_params.setdefault('boundary', args.boundary)
+    sim_params.setdefault('dt', args.dt)
+    sim_params.setdefault('steps', args.steps)
+    sim_params.setdefault('ps', args.ps)
+    sim_params.setdefault('alpha', args.alpha)
+    sim_params.setdefault('prolif_capacity', args.prolif_capacity)
+    sim_params.setdefault('mean_cycle', args.mean_cycle)
+    sim_params.setdefault('sd_cycle', args.sd_cycle)
+    sim_params.setdefault('diff_constant', args.diff_constant)
+    sim_params.setdefault('decay', args.decay)
+    sim_params.setdefault('initial_nutrient', args.initial_nutrient)
+    sim_params.setdefault('uptake_nonstem', args.uptake_nonstem)
+    sim_params.setdefault('uptake_stem', args.uptake_stem)
+    sim_params.setdefault('diffusion_substeps', args.diffusion_substeps)
+    sim_params.setdefault('chemotaxis_beta', args.chemotaxis_beta)
 
-        capture_every = output_params.get('frames_capture_every', 1)
-        capture_frames = output_params.get('save_gif', True)
+    # Also ensure therapy_conf exists (even if empty)
+    therapy_conf.setdefault('therapy_on', args.therapy_on)
+    therapy_conf.setdefault('therapy_start', args.therapy_start)
+    therapy_conf.setdefault('therapy_duration', args.therapy_duration)
+    therapy_conf.setdefault('therapy_period', args.therapy_period)
+    therapy_conf.setdefault('therapy_kill_prob_nonstem', args.therapy_kill_prob_nonstem)
+    therapy_conf.setdefault('therapy_kill_prob_stem', args.therapy_kill_prob_stem)
+    therapy_conf.setdefault('therapy_reduce_prolif', args.therapy_reduce_prolif)
+    therapy_conf.setdefault('therapy_apply_each_step', args.therapy_apply_each_step)
 
+    # Initial seeding
+    init_seed.setdefault('init_seed', args.init_seed)
+    init_seed.setdefault('seed_count', args.seed_count)
 
+    if args.seed_coords:
+        coords = args.seed_coords.split(';')
+        seed_coords = []
+        for coord in coords:
+            part = coord.strip().strip('()')
+            x_str, y_str = part.split(',')
+            seed_coords.append((int(x_str), int(y_str)))
+        init_seed.setdefault('seed_coords', seed_coords)
 
-    # Initialize simulator
-    sim = TumorSimulator(**sim_params.values(), therapy_conf=therapy_conf)
-    sim.initialize(init_seed=init_seed)
+    # Output defaults
+    output_params.setdefault('save_gif', args.save_gif)
+    output_params.setdefault('save_time_series_png', args.save_time_series_png)
+    output_params.setdefault('save_time_series_csv', args.save_time_series_csv)
+    output_params.setdefault('output_gif', args.output_gif)
+    output_params.setdefault('output_time_series_png', args.output_time_series_png)
+    output_params.setdefault('output_time_series_csv', args.output_time_series_csv)
+    output_params.setdefault('frames_capture_every', args.frames_capture_every)
+    output_params.setdefault('fps', args.fps)
+    output_params.setdefault('output_dir', args.output_dir)
 
-    # Run simulation
-    sim.run(capture_frames=capture_frames, capture_every=capture_every)
+    # Print Header and Parameters
+    print_header(version=args.v)
 
-    # Save gifted results
-    if capture_frames:
-        sim.save_gif(filename=output_params.get('output_gif', 'tumor.gif'))
+    if mess:
+        print(mess)
+        print("")
     
-    # Save time series plot
-    if output_params.get('save_time_series_png', True):
-        sim.save_time_series_png(filename=output_params.get('output_time_series_png', 'time_series.png'))
+    else:
+        print("Using configuration from command line arguments.")
+        print("")
 
-    if output_params.get('save_time_series_csv', True):
-        sim.save_time_series_csv(filename=output_params.get('output_time_series_csv', 'counts.csv'))
+    print('-'*11, "Simulation Parameters", '-'*11)
+    print_simulation_parameters(sim_params)
+
+    print('-'*11, "Therapy Configuration", '-'*11)
+    print_simulation_parameters(therapy_conf)
+
+    print('-'*11, "Output Parameters", '-'*11)
+    print_simulation_parameters(output_params)
+
+    # Run Simulation
+    # sim = TumorSimulator(
+    #                     nx = sim_params['nx'], ny = sim_params['ny'],
+    #                     neighborhood = sim_params['neighborhood'],
+    #                     boundary = sim_params['boundary'],
+    #                     dt= sim_params['dt'], steps = sim_params['steps'],
+    #                     ps = sim_params['ps'],
+    #                     alpha = sim_params['alpha'],
+    #                     prolif_capacity = sim_params['prolif_capacity'],
+    #                     mean_cycle = sim_params['mean_cycle'],
+    #                     sd_cycle = sim_params['sd_cycle'],
+    #                     diff_constant = sim_params['D'],
+    #                     decay = sim_params['decay'],
+    #                     initial_nutrient = sim_params['initial_nutrient'],
+    #                     uptake_nonstem = sim_params['uptake_nonstem'],
+    #                     uptake_stem = sim_params['uptake_stem'],
+    #                     diffusion_substeps = sim_params['diffusion_substeps'],
+    #                     chemotaxis_beta = sim_params['chemotaxis_beta'],
+    #                     therapy_conf=therapy_conf
+    #                     )
+
+    sim = TumorSimulator(**sim_params, therapy_conf=therapy_conf)
+    
+    sim.initialize(init_seed=init_seed["init_seed"],
+                   seed_coords=init_seed.get("seed_coords", None),
+                   seed_count=init_seed.get("seed_count", None))
+
+    capture_frames = output_params['save_gif']
+    capture_every = output_params['frames_capture_every']
+
+    print("Running simulation...")
+    sim.run(capture_frames=capture_frames, capture_every=capture_every, output_dir=output_params['output_dir'])
+    
+
+    if capture_frames:
+        print("Saving GIF...")
+        sim.save_gif(filename=output_params['output_gif'],
+                     fps=output_params['fps'])
+    
+    if output_params['save_time_series_png']:
+        print("Saving time series PNG...")
+        sim.save_time_series_png(filename=output_params['output_time_series_png'])
+
+    if output_params['save_time_series_csv']:
+        print("Saving time series CSV...")
+        sim.save_time_series_csv(filename=output_params['output_time_series_csv'])
 
     print("Simulation completed.")
