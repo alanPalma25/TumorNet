@@ -5,306 +5,767 @@ from matplotlib import colors
 import imageio
 import argparse
 import configparser
+import scienceplots
 
+# Define the style for plots
+plt.style.use(['science', 'notebook', 'no-latex']) 
+"""
+TumorSimulator module (importable).
 
-# ======================================================
-# === Parameter and Configuration System ===============
-# ======================================================
+Usage:
+    from tumor_simulator import TumorSimulator
+    sim = TumorSimulator(...)
+    sim.initialize(...)
+    sim.step()
+    sim.get_frame()  # for notebook display
+    df = sim.to_dataframe()
+"""
+from dataclasses import dataclass
+import math, random, csv
+from typing import Optional, Tuple, List
+import numpy as np
+import matplotlib.pyplot as plt
+import imageio
+from io import BytesIO
+from PIL import Image
 
-class Parameters:
-    """Holds all constants for the simulation, can load from CLI or .ini."""
-    def __init__(self):
-        # --- Default parameters ---
-        self.Lx, self.Ly = 60, 60
-        self.seed = 12
+@dataclass
+class Cell:
+    """
+    Cell class representing a single cell in the lattice.
+        Attributes:
+            is_stem (bool): whether the cell is a stem cell
+            proliferation_capacity (int): remaining divisions for non-stem cells
+            ps (float): probability of symmetric stem cell division
+            alpha (float): probability of apoptosis upon division attempt
+            tc (float): time to next cell division
+            mean_cycle (float): mean cell cycle duration
+            sd_cycle (float): standard deviation of cell cycle duration
+    """
+    is_stem: bool
+    proliferation_capacity: int
+    ps: float
+    alpha: float
+    tc: float
+    mean_cycle: float = 24.0
+    sd_cycle: float = 2.0
 
-        # Cell types
-        self.EMPTY, self.CSC, self.PC = 0, 1, 2
+    def advance_time(self, dt: float):
+        """Advance the cell's division timer by dt."""
+        self.tc = max(0.0, self.tc - dt)
 
-        # Rates
-        self.rate_div_CSC = 0.12
-        self.rate_div_PC = 0.20
-        self.rate_death_CSC = 0.002
-        self.rate_death_PC = 0.01
-        self.rate_move = 0.04
+    def generate_tc(self):
+        """Generate a new division timer based on the cell's cycle parameters."""
+        t = random.gauss(self.mean_cycle, self.sd_cycle)
+        return max(0.1, t)
 
-        # CSC division outcomes
-        self.p_sym_self = 0.12
-        self.p_sym_diff = 0.04
-        self.pc_max_divisions = 3
-
-        # Nutrient PDE parameters
-        self.use_nutrient = True
-        self.D = 1.0
-        self.decay = 0.01
-        self.uptake = 0.02
-        self.nutrient_source = 1.0
-        self.nutrient_dt = 0.4
-
-        # Therapy parameters
-        self.use_therapy = True
-        self.therapy_start = 10.0
-        self.therapy_end = 18.0
-        self.therapy_fold_increase_PC_death = 20.0
-        self.therapy_fold_increase_CSC_death = 5.0
-
-        # Simulation controls
-        self.t_max = 2000.
-        self.frames_count = 100
-        self.snapshot_times = np.linspace(0, self.t_max, self.frames_count)
-
-        # Output
-        self.out_dir = 'output'
-        self.out_gif = os.path.join(self.out_dir, 'tumor_dynamics.gif')
-        self.out_csv = os.path.join(self.out_dir, 'simulation_data.csv')
-
-    def apply_seed(self):
-        np.random.seed(self.seed)
-        random.seed(self.seed)
-
-    # ---------- CONFIGURATION LOADING ---------------
-    def load_from_ini(self, filename):
-        """Load parameters from an .ini configuration file."""
-        config = configparser.ConfigParser()
-        config.read(filename)
-        if 'SIMULATION' in config:
-            for key, val in config['SIMULATION'].items():
-                if hasattr(self, key):
-                    casted_val = self._cast_value(val)
-                    setattr(self, key, casted_val)
-
-    def load_from_args(self, args):
-        """Override parameters with command-line arguments (if provided)."""
-        for key, val in vars(args).items():
-            if val is not None and hasattr(self, key):
-                setattr(self, key, val)
-
-    def _cast_value(self, val):
-        """Infer type of value from string."""
-        for cast in (int, float):
-            try: return cast(val)
-            except ValueError: pass
-        if val.lower() in ('true', 'false'):
-            return val.lower() == 'true'
-        return val
-
-
-# ======================================================
-# === Simulation Components ============================
-# ======================================================
+    def attempt_divide(self):
+        """Check if the cell is ready to divide."""
+        return self.tc <= 1e-8
 
 class Lattice:
-    """Represents spatial lattice for cells and nutrients."""
-    def __init__(self, params: Parameters):
-        self.p = params
-        self.cell_type = np.zeros((self.p.Lx, self.p.Ly), dtype=np.int8)
-        self.pc_div_left = np.zeros((self.p.Lx, self.p.Ly), dtype=np.int8)
-        self.nutrient = np.ones((self.p.Lx, self.p.Ly)) * self.p.nutrient_source if self.p.use_nutrient else None
-        self.nbrs = [(-1,-1),(-1,0),(-1,1),(0,-1),(0,1),(1,-1),(1,0),(1,1)]
+    def __init__(self, nx:int, ny:int, neighborhood:str='moore', boundary:str='reflective'):
+        assert neighborhood in ('moore','von_neumann')
+        assert boundary in ('periodic','reflective','dirichlet')
+        self.nx = nx
+        self.ny = ny
+        self.neighborhood = neighborhood
+        self.boundary = boundary
+        self.grid = np.empty((nx, ny), dtype=object)
 
-        cx, cy = self.p.Lx // 2, self.p.Ly // 3
-        self.cell_type[cx-5, cy] = self.p.PC
-        self.cell_type[cx+5, cy] = self.p.CSC
-        self.pc_div_left[self.cell_type == self.p.PC] = self.p.pc_max_divisions
+    def in_bounds(self, x, y):
+        """Check if coordinates are within lattice bounds."""
+        return 0 <= x < self.nx and 0 <= y < self.ny
 
-    def in_bounds(self, x, y): return 0 <= x < self.p.Lx and 0 <= y < self.p.Ly
+    def wrap_coords(self, x, y):
+        """Wrap coordinates for periodic boundaries."""
+        if self.boundary == 'periodic':
+            return x % self.nx, y % self.ny
+        return x, y
 
-    def get_empty_neighbors(self, x, y):
-        coords = []
-        for dx, dy in self.nbrs:
+    def get_neighbors(self, x, y):
+        """
+        Get the coordinates of the neighboring cells.
+            Inputs:
+                x (int): x-coordinate of the cell
+                y (int): y-coordinate of the cell
+            Outputs:
+                coords (list of tuples): list of (i,j) coordinates of neighboring cells
+        """
+        # Select neighbor deltas based on neighborhood type
+        if self.neighborhood == 'von_neumann':
+            deltas = [(-1,0),(1,0),(0,-1),(0,1)]
+        else:
+            deltas = [(-1,-1),(-1,0),(-1,1),(0,-1),(0,1),(1,-1),(1,0),(1,1)]
+
+        coords=[]
+
+        for dx, dy in deltas:
             nx, ny = x + dx, y + dy
-            if self.in_bounds(nx, ny) and self.cell_type[nx, ny] == self.p.EMPTY:
+            if self.boundary=='periodic':
+                nx, ny = self.wrap_coords(nx, ny) 
                 coords.append((nx, ny))
+            else:
+                if self.in_bounds(nx, ny): 
+                    coords.append((nx, ny))
         return coords
 
-    def nutrient_step(self, dt):
-        if not self.p.use_nutrient: return
-        new = self.nutrient.copy()
-        lap = np.zeros_like(self.nutrient)
-        lap[1:-1, 1:-1] = (
-            self.nutrient[2:, 1:-1] + self.nutrient[:-2, 1:-1] +
-            self.nutrient[1:-1, 2:] + self.nutrient[1:-1, :-2] -
-            4 * self.nutrient[1:-1, 1:-1]
-        )
-        uptake_field = np.zeros_like(self.nutrient)
-        uptake_field[self.cell_type != self.p.EMPTY] = self.p.uptake
-        new += dt * (self.p.D * lap - self.p.decay * self.nutrient - uptake_field)
-        new[0, :], new[-1, :], new[:, 0], new[:, -1] = [self.p.nutrient_source]*4
-        new[new < 0] = 0.0
-        self.nutrient = new
+    def vacant_neighbors(self,x,y):
+        """
+        Get a list of vacant neighboring coordinates.
+            Inputs:
+                x (int): x-coordinate of the cell
+                y (int): y-coordinate of the cell
+            Outputs:
+                vacancies (list of tuples): list of (i,j) coordinates of vacant neighbors
+        """
+        return [(i,j) for (i,j) in self.get_neighbors(x,y) if self.grid[i,j] is None]
 
+    def place_cell(self,x,y,cell:Cell): 
+        """Place a cell at the specified coordinates."""
+        self.grid[x,y]=cell
 
-class EventSystem:
-    """Handles Gillespie event calculations."""
-    def __init__(self, lattice: Lattice):
-        self.lattice = lattice
-        self.p = lattice.p
+    def remove_cell(self,x,y): 
+        """Remove a cell from the specified coordinates."""
+        self.grid[x,y]=None
 
-    def compute_propensities(self, current_time):
-        events, rates = [], []
-        if self.p.use_therapy and self.p.therapy_start <= current_time <= self.p.therapy_end:
-            rd_pc = self.p.rate_death_PC * self.p.therapy_fold_increase_PC_death
-            rd_csc = self.p.rate_death_CSC * self.p.therapy_fold_increase_CSC_death
+    def iterate_cells_random_order(self):
+        """
+        Iterate over all occupied grid cells in random order.
+            Output:
+                coords (list of tuples): list of (x,y) coordinates of occupied cells 
+                                         in random order
+        """
+        # Check occupied cells
+        occ = np.vectorize(lambda c: c is not None)(self.grid)
+        # Get their coordinates
+        coords = list(zip(*np.nonzero(occ)))
+        # Convert indices to int and shuffle
+        coords = [(int(a),int(b)) for a,b in coords]
+        random.shuffle(coords)
+
+        return coords
+    
+    def counts(self):
+        """Count total, stem, and non-stem cells in the lattice."""
+        tot = stem = ns = 0
+        for i in range(self.nx):
+            for j in range(self.ny):
+                c = self.grid[i,j]
+                if c is not None:
+                    tot += 1
+                    if c.is_stem: 
+                        stem += 1
+                    else: 
+                        ns += 1
+        return {'total': tot,'stem': stem,'non_stem': ns}
+
+class NutrientField:
+    def __init__(self, nx, ny, D=1.0, decay=0.0, boundary='reflective', initial_value=1.0):
+        self.nx=nx; self.ny=ny
+        self.D=float(D); self.decay=float(decay)
+        self.boundary=boundary
+        self.n_iv = float(initial_value)
+        self.c = np.full((nx,ny), float(initial_value), dtype=float)
+
+    def laplacian(self, arr):
+        """
+        Compute the Laplacian of a 2D array.
+            Inputs:
+                arr (array, float): 2D array to compute the Laplacian of
+            Outputs:
+                lap (array, float): 2D array of the Laplacian
+        """
+        nx,ny=self.nx,self.ny
+        lap=np.zeros_like(arr)
+        for i in range(nx):
+            for j in range(ny):
+                center=arr[i,j]; s=0.0; count=0
+                for di,dj in [(-1,0),(1,0),(0,-1),(0,1)]:
+                    ni,nj=i+di,j+dj
+                    if self.boundary=='periodic':
+                        ni%=nx; nj%=ny; s+=arr[ni,nj]; count+=1
+                    else:
+                        if 0<=ni<nx and 0<=nj<ny:
+                            s += arr[ni,nj]; count+=1
+                        else:
+                            if self.boundary=='reflective':
+                                ri=min(max(ni,0),nx-1); rj=min(max(nj,0),ny-1)
+                                s += arr[ri,rj]; count+=1
+                            elif self.boundary=='dirichlet':
+                                s += 0.0; count+=1
+                lap[i,j] = s - count*center
+        return lap
+
+    def rhs(self, c, uptake_map):
+        """
+        Right-hand side of the nutrient PDE.
+            Inputs:
+                c (array, float): current nutrient concentration
+                uptake_map (array, float): 2D array of uptake rates
+            Outputs:
+                arr (array, float): RHS of the PDE
+        """
+        return self.D * self.laplacian(c) - self.decay*c - uptake_map
+
+    def rk4_step(self, dt, uptake_map):
+        """
+        Run a single RK4 step.
+            Inputs:
+                dt (float): time step
+                uptake_map (array, float): 2D array of uptake rates
+            Outputs:
+                None (updates self.c in place)
+        """
+        c0=self.c
+        k1 = self.rhs(c0, uptake_map)
+        k2 = self.rhs(c0 + 0.5*dt*k1, uptake_map)
+        k3 = self.rhs(c0 + 0.5*dt*k2, uptake_map)
+        k4 = self.rhs(c0 + dt*k3, uptake_map)
+        self.c = c0 + (dt/6.0)*(k1 + 2*k2 + 2*k3 + k4)
+        np.maximum(self.c, 0.0, out=self.c)
+
+    def advance(self, total_dt, uptake_map, substeps=5):
+        """
+        Advance the nutrient field by a given time subesteps using RK4.
+            Inputs:
+                total_dt (float): total time to advance
+                uptake_map (array, float): 2D array of uptake rates
+                substeps (int): number of RK4 substeps to perform
+            Outputs:
+                None (updates self.c in place)
+        """
+        if substeps<=0: 
+            substeps=1
+
+        h = total_dt/float(substeps)
+
+        for _ in range(substeps):
+            # Use RK4 to update nutrient field
+            self.rk4_step(h, uptake_map)
+
+class TumorSimulator:
+    def __init__(self,
+                 nx = 100, ny = 100,
+                 neighborhood = 'moore', boundary = 'reflective',
+                 dt = 1.0, steps = 240,
+                 ps = 0.5, alpha = 0.0, prolif_capacity = 5,
+                 mean_cycle = 24.0, sd_cycle = 2.0,
+                 D = 1.0, decay = 0.0, initial_nutrient = 1.0,
+                 uptake_nonstem = 0.02, uptake_stem = 0.01,
+                 diffusion_substeps = 5, chemotaxis_beta = 3.0,
+                 therapy_conf: dict = None,
+                 seed: Optional[int] = None):
+        if seed is not None:
+            random.seed(int(seed)); np.random.seed(int(seed))
+        
+        # lattice and nutrient field
+        self.lattice = Lattice(nx, ny, neighborhood, boundary)
+        self.nutrient = NutrientField(nx, ny, D, decay, boundary, initial_nutrient)
+
+        # sim params
+        self.dt = float(dt); self.steps = int(steps)
+        self.default_ps = float(ps); self.default_alpha = float(alpha); self.default_prolif_capacity = int(prolif_capacity)
+        self.mean_cycle = float(mean_cycle); self.sd_cycle = float(sd_cycle)
+
+        # nutrient coupling params
+        self.uptake_nonstem = float(uptake_nonstem); self.uptake_stem = float(uptake_stem)
+        self.diffusion_substeps = int(diffusion_substeps); self.chemotaxis_beta = float(chemotaxis_beta)
+
+        # therapy
+        therapy_conf = therapy_conf or {}
+        self.therapy_on = therapy_conf.get('therapy_on', False)
+        self.therapy_start = float(therapy_conf.get('therapy_start', 0.0))
+        self.therapy_duration = float(therapy_conf.get('therapy_duration', 0.0))
+        self.therapy_period = float(therapy_conf.get('therapy_period', 0.0))
+        self.therapy_kill_prob_nonstem = float(therapy_conf.get('therapy_kill_prob_nonstem', 0.5))
+        self.therapy_kill_prob_stem = float(therapy_conf.get('therapy_kill_prob_stem', 0.1))
+        self.therapy_reduce_prolif = int(therapy_conf.get('therapy_reduce_prolif', 0))
+        self.therapy_apply_each_step = bool(therapy_conf.get('therapy_apply_each_step', True))
+
+        # storage/visualization
+        self.frames = []  # list of numpy arrays (RGB) for gif
+        self.time_series = []
+        self.cmap = {'empty':"white",'stem': "green",'non_stem':"yellow"}
+
+    def initialize(self, init_seed='single', seed_coords:Optional[List[Tuple[int,int]]]=None, seed_count:int=1):
+        """
+        Initialize the tumor simulator.
+            Inputs:
+                init_seed (str): Initialization strategy ('single', 'cluster', 'random')
+                seed_coords (list of tuples): Specific coordinates for cell placement
+                seed_count (int): Number of cells to initialize
+            Outputs:
+                None
+        """
+        nx,ny = self.lattice.nx, self.lattice.ny
+        if seed_coords:
+            coords = seed_coords
         else:
-            rd_pc, rd_csc = self.p.rate_death_PC, self.p.rate_death_CSC
+            if init_seed=='single': 
+                coords=[(nx//2, ny//2)]
 
-        xs, ys = np.nonzero(self.lattice.cell_type != self.p.EMPTY)
-        for x, y in zip(xs, ys):
-            c = self.lattice.cell_type[x, y]
-            nut_factor = 1.0
-            if self.p.use_nutrient:
-                nloc = self.lattice.nutrient[x, y]
-                nut_factor = nloc / (0.5 + nloc)
+            elif init_seed=='cluster':
+                cx,cy = nx//2, ny//2
+                coords = [(cx+dx, cy+dy) for dx in (-1,0,1) for dy in (-1,0,1)]
 
-            if c == self.p.CSC:
-                rdiv, rdeath, rmove = self.p.rate_div_CSC * nut_factor, rd_csc, self.p.rate_move
-            elif c == self.p.PC:
-                rdiv = self.p.rate_div_PC * nut_factor if self.lattice.pc_div_left[x, y] > 0 else 0.0
-                rdeath, rmove = rd_pc, self.p.rate_move * 0.5
-            else:
+            elif init_seed=='random':
+                coords=[]
+
+                while len(coords)<seed_count:
+                    x=random.randrange(nx); y=random.randrange(ny)
+
+                    if self.lattice.grid[x,y] is None: 
+                        coords.append((x,y))
+
+            else: 
+                raise ValueError('Unknown init_seed')
+
+        for (x,y) in coords:
+            if 0<=x<nx and 0<=y<ny:
+                c = Cell(is_stem=True, proliferation_capacity=self.default_prolif_capacity, ps=self.default_ps,
+                         alpha=self.default_alpha, tc=random.gauss(self.mean_cycle, self.sd_cycle),
+                         mean_cycle=self.mean_cycle, sd_cycle=self.sd_cycle)
+                self.lattice.place_cell(x,y,c)
+        self.init_seed = init_seed
+
+    # Utility 
+    def compute_uptake_map(self):
+        """
+        Nutrient consumption map based on current lattice state.
+            Output:
+                arr(array, float): 2D array of uptake rates
+        """
+        arr = np.zeros((self.lattice.nx, self.lattice.ny), dtype=float)
+        for i in range(self.lattice.nx):
+            for j in range(self.lattice.ny):
+                c = self.lattice.grid[i,j]
+                if c is not None:
+                    arr[i,j] = self.uptake_stem if c.is_stem else self.uptake_nonstem
+        return arr
+
+    def therapy_active_at_time(self,t):
+        """
+        Check if therapy is active at time t.
+            Inputs:
+                t (float): current time
+            Outputs:
+                active (bool): whether therapy is active
+        """
+        if not self.therapy_on: 
+            return False
+        
+        if self.therapy_period>0:
+            if t < self.therapy_start: 
+                return False
+            dt = t - self.therapy_start
+            in_period = (dt % self.therapy_period)
+            return in_period < self.therapy_duration
+        else:
+            return (t >= self.therapy_start) and (t < self.therapy_start + self.therapy_duration)
+
+    def choose_division_site_with_chemotaxis(self, x,y, vacancies):
+        """
+        Choose a division site for the cell using chemotaxis.
+            Inputs:
+                x (int): x-coordinate of the cell
+                y (int): y-coordinate of the cell
+                vacancies (list of tuples): list of (i,j) coordinates of vacant neighbors
+            Outputs:
+                dest (tuple): (i,j) coordinates of chosen division site
+        """
+        # If there are no vacancies, return None
+        if len(vacancies)==0: 
+            return None
+        
+        # If chemotaxis is disabled, choose randomly
+        if self.chemotaxis_beta==0.0: 
+            return random.choice(vacancies)
+        
+        # Nutrient concentration at current cell
+        cur = self.nutrient.c[x,y]
+        weights=[]
+
+        # Compute weights based on nutrient differences
+        for (i,j) in vacancies:
+            delta = self.nutrient.c[i,j] - cur
+
+            # Compute chemotaxis weights with clamping to avoid overflow
+            w = math.exp(max(min(self.chemotaxis_beta * delta, 50.0), -50.0))
+            weights.append(w)
+
+        tot=sum(weights)
+
+        # Select site based on weights
+        if tot<=0: 
+            return random.choice(vacancies)
+        
+        r = random.random()*tot 
+        cum=0.0
+
+        for k,(i,j) in enumerate(vacancies):
+            cum += weights[k]
+            if r <= cum: 
+                return (i,j)
+        return vacancies[-1]
+
+    def step(self, step_idx:int):
+        """
+        Perform a single simulation step.
+            Inputs:
+                step_idx (int): current step index
+            Outputs:
+                None (updates lattice and nutrient field in place)
+        """
+        t = step_idx * self.dt
+        uptake = self.compute_uptake_map()
+        self.nutrient.advance(self.dt, uptake, substeps=self.diffusion_substeps)
+        coords = self.lattice.iterate_cells_random_order()
+        for (x,y) in coords:
+            # Get cell object
+            cell = self.lattice.grid[x,y]
+            if cell is None: 
                 continue
 
-            if self.lattice.get_empty_neighbors(x, y):
-                if rdiv > 0: events.append(('div', x, y)); rates.append(rdiv)
-                events.append(('move', x, y)); rates.append(rmove)
-            events.append(('death', x, y)); rates.append(rdeath)
+            # Check therapy if active in this step
+            therapy_active = self.therapy_active_at_time(t)
+            if therapy_active and self.therapy_apply_each_step:
+                kill_prob = self.therapy_kill_prob_stem if cell.is_stem else self.therapy_kill_prob_nonstem
+                if random.random() < kill_prob:
+                    # Kill the cell
+                    self.lattice.remove_cell(x,y)
+                    continue
+                # Reduce proliferation capacity for non-stem cells
+                if self.therapy_reduce_prolif>0 and not cell.is_stem:
+                    cell.proliferation_capacity = max(0, cell.proliferation_capacity - self.therapy_reduce_prolif)
 
-        if not rates:
-            return [], [], 0.0
-        rates = np.array(rates, dtype=float)
-        return events, rates, rates.sum()
+            # Update cell division timer
+            cell.advance_time(self.dt)
 
+            # Check if the cell is ready to divide
+            if cell.attempt_divide():
+                vac = self.lattice.vacant_neighbors(x,y)
 
-class TumorSimulation:
-    """Main simulation controller."""
-    def __init__(self, params: Parameters):
-        self.p = params
-        self.p.apply_seed()
-        self.lattice = Lattice(params)
-        self.event_system = EventSystem(self.lattice)
-        self.t, self.event_count = 0.0, 0
-        self.max_events = 2_000_000
-        self.tempdir = tempfile.mkdtemp()
-        self.frames, self.frame_idx = [], 0
-        self.next_snapshot_idx = 0
-        self.data_records = []
-
-    def record_state(self):
-        csc = np.sum(self.lattice.cell_type == self.p.CSC)
-        pc = np.sum(self.lattice.cell_type == self.p.PC)
-        mean_n = np.mean(self.lattice.nutrient) if self.p.use_nutrient else 0
-        self.data_records.append((self.t, csc, pc, mean_n))
-
-    def capture_frame(self):
-        cmap = colors.ListedColormap(['white', 'red', 'blue'])
-        bounds = [0, 0.5, 1.5, 2.5]
-        norm = colors.BoundaryNorm(bounds, cmap.N)
-        fig = plt.figure(figsize=(4, 4), dpi=100)
-        ax = fig.add_axes([0, 0, 1, 1])
-        ax.imshow(self.lattice.cell_type.T, origin='lower', cmap=cmap, norm=norm)
-        ax.text(2, 2, f"t={self.t:.2f}", color='black', bbox=dict(facecolor='white', alpha=0.6), fontsize=8)
-        fname = os.path.join(self.tempdir, f"frame_{self.frame_idx:04d}.png")
-        fig.savefig(fname, dpi=100)
-        plt.close(fig)
-        self.frames.append(fname)
-        self.frame_idx += 1
-
-    def run(self):
-        start_wall = pytime.time()
-        self.capture_frame()
-        self.record_state()
-
-        while self.t < self.p.t_max and self.event_count < self.max_events:
-            events, rates, total_rate = self.event_system.compute_propensities(self.t)
-            if total_rate <= 0: break
-            dt = -math.log(np.random.rand()) / total_rate
-            self.t += dt
-            if self.p.use_nutrient:
-                for _ in range(max(1, int(math.ceil(dt / self.p.nutrient_dt)))):
-                    self.lattice.nutrient_step(dt)
-            ev = random.choices(events, weights=rates, k=1)[0]
-            self.handle_event(ev)
-            self.event_count += 1
-            self.record_state()
-            if self.next_snapshot_idx < len(self.p.snapshot_times) and self.t >= self.p.snapshot_times[self.next_snapshot_idx]:
-                self.capture_frame()
-                self.next_snapshot_idx += 1
-
-        self.capture_frame()
-        end_wall = pytime.time()
-        print(f"Simulation finished: t={self.t:.2f}, events={self.event_count}, wall_time={end_wall - start_wall:.1f}s")
-        self.save_data()
-
-    def handle_event(self, ev):
-        etype, x, y = ev
-        ct, div = self.lattice.cell_type, self.lattice.pc_div_left
-        if etype == 'death':
-            ct[x, y] = self.p.EMPTY; div[x, y] = 0
-        elif etype == 'move':
-            nb = self.lattice.get_empty_neighbors(x, y)
-            if nb:
-                nx, ny = random.choice(nb)
-                ct[nx, ny] = ct[x, y]; div[nx, ny] = div[x, y]
-                ct[x, y] = self.p.EMPTY; div[x, y] = 0
-        elif etype == 'div':
-            nb = self.lattice.get_empty_neighbors(x, y)
-            if not nb: return
-            nx, ny = random.choice(nb)
-            if ct[x, y] == self.p.CSC:
-                r = np.random.rand()
-                if r < self.p.p_sym_self:
-                    ct[nx, ny] = self.p.CSC; div[nx, ny] = 0
-                elif r < self.p.p_sym_self + self.p.p_sym_diff:
-                    ct[x, y] = ct[nx, ny] = self.p.PC
-                    div[x, y] = div[nx, ny] = self.p.pc_max_divisions - 1
+                # If no vacancies, attempt migration
+                if len(vac)==0:
+                    self._attempt_migration(x,y,cell)
                 else:
-                    ct[nx, ny] = self.p.PC; div[nx, ny] = self.p.pc_max_divisions - 1
-            elif ct[x, y] == self.p.PC and div[x, y] > 0:
-                ct[nx, ny] = self.p.PC
-                div[nx, ny] = div[x, y] - 1
-                div[x, y] -= 1
+                    # Consider apoptosis upon division
+                    if random.random() < cell.alpha:
+                        self.lattice.remove_cell(x,y)
+                        continue
+                    # If not apoptotic, perform division
+                    dest = self.choose_division_site_with_chemotaxis(x,y,vac)
+                    self._perform_division(x,y,dest,cell)
+            else:
+                # Attempt migration with 20% probability
+                if random.random() < 0.2:
+                    self._attempt_migration(x,y,cell)
 
-    def save_data(self):
-        os.makedirs(self.p.out_dir, exist_ok=True)
-        np.savetxt(self.p.out_csv, self.data_records, delimiter=",",
-                   header="time,CSC_count,PC_count,mean_nutrient", comments="")
-        print(f"Saved data to {self.p.out_csv}")
+        cnts = self.lattice.counts()
+        cnts.update({
+            'time': t,
+            'avg_nutrient': float(np.mean(self.nutrient.c)),
+            'min_nutrient': float(np.min(self.nutrient.c)),
+            'max_nutrient': float(np.max(self.nutrient.c)),
+            'therapy_active': int(self.therapy_active_at_time(t)),
+            'cell_state': self.lattice.grid.copy()
+        })
+        self.time_series.append(cnts)
 
-    def save_gif(self, duration=3.0):
-        os.makedirs(self.p.out_dir, exist_ok=True)
-        images = [imageio.imread(f) for f in self.frames]
-        imageio.mimsave(self.p.out_gif, images, duration=duration)
-        print(f"GIF saved to {self.p.out_gif}")
+    def _attempt_migration(self, x, y, cell):
+        """
+        Attempt to migrate the cell to a vacant neighboring position.
+            Inputs:
+                x (int): x-coordinate of the cell
+                y (int): y-coordinate of the cell
+                cell (Cell): the cell object to migrate
+            Outputs:
+                migrated (bool): whether the cell migrated
+        """
+        # Get vacant neighboring coordinates
+        vac = self.lattice.vacant_neighbors(x,y)
 
+        # Check if there are vacancies
+        if not vac: 
+            return False
+        
+        # Choose destination with chemotaxis
+        dest = self.choose_division_site_with_chemotaxis(x, y, vac)
 
-# ======================================================
-# === Command-line interface ===========================
-# ======================================================
+        # Migration probability
+        k = len(vac)
+        stay_prob = 1.0 / (1.0 + k) 
 
-def parse_args():
-    parser = argparse.ArgumentParser(description="Tumor growth simulation.")
-    parser.add_argument('--config', type=str, help="Path to .ini configuration file.")
-    parser.add_argument('--Lx', type=int, help="Lattice size X")
-    parser.add_argument('--Ly', type=int, help="Lattice size Y")
-    parser.add_argument('--t_max', type=float, help="Maximum simulation time")
-    parser.add_argument('--seed', type=int, help="Random seed")
-    parser.add_argument('--save_gif', action='store_true', help="Save GIF after simulation")
-    return parser.parse_args()
+        # If the cell decides to stay, do nothing
+        if random.random() < stay_prob:
+            return False
+        # Move the cell to the chosen destination
+        self.lattice.place_cell(dest[0], dest[1], cell)
+        # Remove the cell from its original position
+        self.lattice.remove_cell(x, y)
 
+        return True
 
-def main():
-    args = parse_args()
-    p = Parameters()
-    if args.config:
-        p.load_from_ini(args.config)
-    p.load_from_args(args)
+    def _perform_division(self, x,y,dest,mother:Cell):
+        """
+        Perform cell division.
+            Inputs:
+                x (int): x-coordinate of the mother cell
+                y (int): y-coordinate of the mother cell
+                dest (tuple): (i,j) coordinates of the daughter cell's position
+                mother (Cell): the mother cell object
+            Outputs:
+                None (updates lattice in place)
+        """
+        # Base case: no destination
+        if dest is None: 
+            return
+        
+        # non-stem
+        if not mother.is_stem:
+            # Update the proliferation capacity
+            mother.proliferation_capacity -= 1
 
-    sim = TumorSimulation(p)
-    sim.run()
+            # If no remaining capacity, remove the mother cell
+            if mother.proliferation_capacity <= 0:
+                self.lattice.remove_cell(x,y)
+                return
 
-    if args.save_gif:
-        sim.save_gif()
+            # Create the daughter cell (inherit mother's properties)
+            daughter = Cell(is_stem=False, proliferation_capacity=mother.proliferation_capacity,
+                            ps=mother.ps, alpha=mother.alpha, tc=mother.generate_tc(),
+                            mean_cycle=mother.mean_cycle, sd_cycle=mother.sd_cycle)
+            
+            # Regenerate division timer
+            mother.tc = mother.generate_tc()
 
+            # Place the daughter cell in the lattice
+            self.lattice.place_cell(dest[0], dest[1], daughter)
+            return
+        
+        # stem-cells
 
-if __name__ == "__main__":
-    main()
+        # Symmetric division
+        if random.random() < mother.ps:
+            daughter = Cell(is_stem=True, proliferation_capacity=mother.proliferation_capacity,
+                            ps=mother.ps, alpha=mother.alpha, tc=mother.generate_tc(),
+                            mean_cycle=mother.mean_cycle, sd_cycle=mother.sd_cycle)
+            mother.tc = mother.generate_tc()
+            self.lattice.place_cell(dest[0], dest[1], daughter)
+        # Asymmetric division    
+        else:
+            daughter = Cell(is_stem=False, proliferation_capacity=mother.proliferation_capacity,
+                            ps=mother.ps, alpha=mother.alpha, tc=mother.generate_tc(),
+                            mean_cycle=mother.mean_cycle, sd_cycle=mother.sd_cycle)
+            
+            # Regenerate division timer
+            mother.tc = mother.generate_tc()
+
+            # Place the daughter cell in the lattice
+            self.lattice.place_cell(dest[0], dest[1], daughter)
+
+    def run(self, start_step = 0, n_steps = None, capture_frames = False, capture_every = 1):
+        """
+        Run the simulation for a specified number of steps.
+            Inputs:
+                start_step (int): step index to start from
+                n_steps (int): number of steps to run (default: until self.steps)
+                capture_frames (bool): whether to capture frames for visualization
+                capture_every (int): interval of steps to capture frames
+            Outputs:
+                None (updates lattice, nutrient field, time series, and frames in place)
+        """
+        if n_steps is None: 
+            n_steps = self.steps
+        
+        end = start_step + n_steps
+        
+        for s in range(start_step, end):
+            self.step(s)
+            if capture_frames and (s % capture_every == 0):
+                self.frames.append(self.get_frame_array(s))
+        return
+
+    def create_output_dir(self, output_dir:Optional[str]=None):
+        """
+        Create output directory for saving results.
+            Inputs:
+                output_dir (str): path to output directory (default: temporary directory)
+            Outputs:
+                output_dir (str): path to created output directory
+        """      
+        if output_dir is None:
+            output_dir = "output"
+
+        # Check if the directory exists, if not create it
+        if os.path.isdir(output_dir):
+            print(f"Directory '{output_dir}' already exists.")
+        else:
+            print(f"Directory '{output_dir}' has been created.")
+            os.mkdir(output_dir)
+
+        self.output_dir = output_dir
+
+    def get_frame_array(self, step_idx:int):
+        """ Generate a visualization frame as a numpy array.
+            Inputs:
+                step_idx (int): current step index 
+            Outputs:
+                arr (numpy array): RGB numpy array
+        """
+        # Determine lattice size
+        nx,ny = self.lattice.nx, self.lattice.ny
+
+        # Define therapy information
+        if self.therapy_on:
+            t_start = f"{self.therapy_start:.1f}"
+            t_end = f"{self.therapy_start + self.therapy_duration:.1f}"
+            therapy_status = f"{t_start} - {t_end}h"
+        else:
+            therapy_status = "Off"
+
+        fig = plt.figure(figsize=(5,5), dpi=100)
+        ax = fig.add_subplot(111)
+        im = ax.pcolormesh(self.nutrient.c.T, cmap='Greys', vmin=0.0, vmax=self.nutrient.n_iv)
+
+        # Empty lists for cell coordinates
+        xs_s, ys_s, xs_n, ys_n = [], [], [], []
+
+        # Collect cell coordinates
+        for i in range(nx):
+            for j in range(ny):
+                c = self.lattice.grid[i,j]
+                if c is not None:
+                    if c.is_stem: 
+                        xs_s.append(i); ys_s.append(j)
+                    else: 
+                        xs_n.append(i); ys_n.append(j)
+        # Scatter plot cells
+        if len(xs_n): 
+            ax.scatter(xs_n, ys_n, s=13, marker='o', facecolors=[self.cmap['non_stem']], 
+                       edgecolors='none', label = "Non-Stem Cells", alpha=0.6)
+        if len(xs_s): 
+            ax.scatter(xs_s, ys_s, s=13, marker='o', facecolors=[self.cmap['stem']], 
+                       edgecolors='none', label = "Stem Cells", alpha=0.6)
+        # Add a title and colorbar
+        ax.set_title(f'Nutrient Field and Cancer Cells\n'+
+                     r'$\rho_{sym}$='+f'{self.default_ps:.2f}, '+
+                     r'$\alpha$='+f'{self.default_alpha:.2f}, '+
+                     r'$\beta$='+f'{self.chemotaxis_beta:.2f}\n'+
+                     r'$D$='+f'{self.nutrient.D:.2f}, '+
+                     f'Therapy= {therapy_status}, '+
+                     f'dt= {self.dt}h, '+
+                     'IC=' + f'{self.init_seed}'.capitalize(), fontsize=11)
+        ax.set_xticks([])
+        ax.set_yticks([])
+        # Add time annotation
+        ax.text(0.01, 0.99, f"Time: {step_idx*self.dt:.1f}h", transform=ax.transAxes, va='top', fontsize=8, 
+                bbox=dict(facecolor='white',alpha=0.7,edgecolor='none'))
+        # Add label legend in a text box
+        ax.legend(frameon = True, fontsize = 8, framealpha=0.7)
+        # Add colorbar
+        cbar = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+        cbar.set_label('Nutrient', fontsize=8)
+
+        fig.canvas.draw()
+
+        # Convert canvas to numpy array
+        w,h = fig.canvas.get_width_height()
+
+        # Get the RGB buffer from the figure
+        arr = np.frombuffer(fig.canvas.tostring_rgb(), dtype='uint8').reshape(h,w,3)
+        plt.close(fig)
+
+        return arr
+    
+    def save_time_series_png(self, filename='time_series.png'):
+        """ Save the time series data as a PNG plot."""
+        # Create output directory if it doesn't exist
+        self.create_output_dir()
+        
+        # Define therapy information
+        if self.therapy_on:
+            t_start = f"{self.therapy_start:.1f}"
+            t_end = f"{self.therapy_start + self.therapy_duration:.1f}"
+            therapy_status = f"{t_start} - {t_end}h"
+        else:
+            therapy_status = "Off"
+
+        if not self.time_series:
+            return
+        # Extract data for plotting
+        times = [row['time'] for row in self.time_series]
+        totals = [row['total'] for row in self.time_series]
+        stems = [row['stem'] for row in self.time_series]
+        non_stems = [row['non_stem'] for row in self.time_series]
+        avg_nutrients = [row['avg_nutrient'] for row in self.time_series]
+
+        fig, ax1 = plt.subplots(figsize=(9,5), dpi=100)
+
+        ax1.plot(times, totals, label='Total Cells', color='blue')
+        ax1.plot(times, stems, label='Stem Cells', color='green')
+        ax1.plot(times, non_stems, label='Non-Stem Cells', color='orange')
+        ax1.set_xlabel('Time (h)', fontsize=11)
+        ax1.set_ylabel('Cell Counts', fontsize=11)
+        ax1.legend(frameon = True, loc = 6, fontsize=8, framealpha=0.7)
+
+        ax2 = ax1.twinx()
+        ax2.plot(times, avg_nutrients, label='Avg Nutrient', color='red', linestyle='--')
+        ax2.set_ylabel('Average Nutrient', fontsize=11)
+        ax2.legend(frameon = True, loc = 'upper right', fontsize=8, framealpha=0.7)
+
+        plt.title('Tumor Growth and Nutrient Dynamics Over Time\n'+
+                  r'$\rho_{sym}$='+f'{self.default_ps:.2f}, '+
+                  r'$\alpha$='+f'{self.default_alpha:.2f}, '+
+                  r'$\beta$='+f'{self.chemotaxis_beta:.2f}\n'+
+                  r'$D$='+f'{self.nutrient.D:.2f}, '+
+                  f'Therapy= {therapy_status}, '+
+                  f'dt= {self.dt}h, '+
+                  'IC=' + f'{self.init_seed}'.capitalize(), fontsize=12)
+        if filename:
+            plt.savefig(self.output_dir + "/" + filename)
+            plt.close(fig)
+            print(f"Time series plot saved to '{self.output_dir}/{filename}'")
+        else:
+            plt.show()
+
+    def get_frame_pil(self, step_idx:int):
+        """Generate a visualization frame as a PIL Image."""
+        arr = self.get_frame_array(step_idx)
+        return Image.fromarray(arr)
+
+    def save_gif(self, filename='tumor.gif', fps=6):
+        """ Save the captured frames as a GIF file."""
+        self.create_output_dir()
+        if not self.frames:
+            # lazily generate frames from time_series length
+            for s in range(len(self.time_series)):
+                self.frames.append(self.get_frame_array(s))
+        imageio.mimsave(self.output_dir + "/" + filename, self.frames, fps=fps)
+        print(f"GIF saved to '{self.output_dir}/{filename}'")
+
+    def to_dataframe(self):
+        """ Convert the time series data to a pandas DataFrame."""
+        try:
+            import pandas as pd
+        except Exception as e:
+            raise RuntimeError("pandas required for to_dataframe()") from e
+        return pd.DataFrame(self.time_series)
+
+    def save_time_series_csv(self, filename='counts.csv'):
+        """Save the time series data to a CSV file."""
+        if not self.time_series:
+            return
+        keys = ["time","total","stem","non_stem","avg_nutrient","min_nutrient","max_nutrient","therapy_active"]
+        with open(filename,'w',newline='') as f:
+            writer = csv.DictWriter(f, fieldnames=keys)
+            writer.writeheader()
+            for row in self.time_series:
+                writer.writerow({k:row.get(k,'') for k in keys})
+
+    def reset_frames(self):
+        self.frames = []
+
+    def reset_time_series(self):
+        self.time_series = []
