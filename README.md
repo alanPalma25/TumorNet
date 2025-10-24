@@ -189,9 +189,11 @@ tumorNet/
 │
 ├── tumorNet/                  
 │   ├── tumorNet.py            # Main simulator
-│   └── __init__.py.csv        
+│   └── __init__.py.csv
+├── setup.py                   # Install tumorNet
+├── config_generator.py        # Script to generate the config file        
 ├── config.ini                 # Example configuration file
-├── output_example/                    # Simulation outputs
+├── output_example/            # Simulation outputs
 │   ├── tumor_dynamics_example.gif
 │   ├── time_series_example.png
 │   └── counts_example.csv
@@ -204,6 +206,7 @@ tumorNet/
 ## 🧑‍💻 Authors
 
 **Alan I. Palma** — Physics Student, Yachay Tech University
+
 **Sofía Feijóo** — Biomedical Engineering student, Yachay Tech University
 
 
