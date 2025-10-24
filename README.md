@@ -43,7 +43,7 @@ The simulation produces:
     
 * **Dual execution**:
 
-  * From command line (`python tumorNet.py -c config.ini`)
+  * From command line
   * From Jupyter notebooks via class instantiation
 
 ---
