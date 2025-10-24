@@ -173,6 +173,10 @@ fps = 10
 
 ## 📈 Example Plot
 
+Movie simulation:
+![Demo GIF](./output_example/tumor_example.gif)
+
+
 The time-series PNG shows population evolution:
 
 * **Blue**: Total cells
