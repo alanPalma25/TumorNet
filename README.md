@@ -71,7 +71,7 @@ Clone the repository:
 git clone https://github.com/alanPalma25/tumorNet.git
 cd TumorNet
 ```
-Use pip for installING:
+Use pip for installing:
 
 ```bash
 pip install -e .
@@ -179,7 +179,6 @@ The time-series PNG shows population evolution:
 * **Green**: Stem cells
 * **Orange**: Non-stem cells
 * **Red dashed**: Average nutrient concentration
-* 
 
 ---
 
