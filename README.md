@@ -174,6 +174,7 @@ fps = 10
 ## 📈 Example Plot
 
 Movie simulation:
+
 ![Demo GIF](./output_example/tumor_example.gif)
 
 
@@ -183,6 +184,8 @@ The time-series PNG shows population evolution:
 * **Green**: Stem cells
 * **Orange**: Non-stem cells
 * **Red dashed**: Average nutrient concentration
+
+![Figure Description](./output_example/time_series_example.png)
 
 ---
 
