@@ -71,7 +71,7 @@ Clone the repository:
 git clone https://github.com/alanPalma25/tumorNet.git
 cd TumorNet
 ```
-Use pip for install:
+Use pip for installING:
 
 ```bash
 pip install -e .
