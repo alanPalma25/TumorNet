@@ -160,7 +160,7 @@ fps = 10
 ```
 ---
 
-## 🧠 Class Structure
+## Class Structure
 
 | Class                | Description                                                                                       |
 | -------------------- | ------------------------------------------------------------------------------------------------- |
@@ -171,7 +171,7 @@ fps = 10
 
 ---
 
-## 📈 Example Plot
+## Example Plot
 
 Movie simulation:
 
@@ -210,7 +210,7 @@ tumorNet/
 
 ---
 
-## 🧑‍💻 Authors
+## Authors
 
 **Alan I. Palma** — Physics Student, Yachay Tech University
 
