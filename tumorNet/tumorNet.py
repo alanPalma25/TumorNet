@@ -1,5 +1,5 @@
 import numpy as np
-import random, math, os, tempfile, time as pytime
+import random, math, os
 import matplotlib.pyplot as plt
 from matplotlib import colors
 import imageio
@@ -290,7 +290,7 @@ class TumorSimulator:
         # storage/visualization
         self.frames = []  # list of numpy arrays (RGB) for gif
         self.time_series = []
-        self.cmap = {'empty':"white",'stem': "limegreen",'non_stem':"coral"}
+        self.cmap = {'empty':"white",'stem': "seagreen",'non_stem':"coral"}
 
     def initialize(self, init_seed='cluster', seed_coords:Optional[List[Tuple[int,int]]]=None, seed_count:int=1):
         """
@@ -981,27 +981,6 @@ if __name__ == "__main__":
 
     print('-'*11, "Output Parameters", '-'*11)
     print_simulation_parameters(output_params)
-
-    # Run Simulation
-    # sim = TumorSimulator(
-    #                     nx = sim_params['nx'], ny = sim_params['ny'],
-    #                     neighborhood = sim_params['neighborhood'],
-    #                     boundary = sim_params['boundary'],
-    #                     dt= sim_params['dt'], steps = sim_params['steps'],
-    #                     ps = sim_params['ps'],
-    #                     alpha = sim_params['alpha'],
-    #                     prolif_capacity = sim_params['prolif_capacity'],
-    #                     mean_cycle = sim_params['mean_cycle'],
-    #                     sd_cycle = sim_params['sd_cycle'],
-    #                     diff_constant = sim_params['D'],
-    #                     decay = sim_params['decay'],
-    #                     initial_nutrient = sim_params['initial_nutrient'],
-    #                     uptake_nonstem = sim_params['uptake_nonstem'],
-    #                     uptake_stem = sim_params['uptake_stem'],
-    #                     diffusion_substeps = sim_params['diffusion_substeps'],
-    #                     chemotaxis_beta = sim_params['chemotaxis_beta'],
-    #                     therapy_conf=therapy_conf
-    #                     )
 
     sim = TumorSimulator(**sim_params, therapy_conf=therapy_conf)
     

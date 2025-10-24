@@ -5,6 +5,9 @@ The user could only modify the parameters from the INI file already created or c
 # Third party libraries
 import configparser
 
+# Name of the file
+name = "config.init" # Editable if needed
+
 # Create an empty dictionary to store the config_orbit.ini file information
 config = configparser.ConfigParser()
 
@@ -58,6 +61,6 @@ config['OUTPUT'] = {
 }
 
 # Save the config file
-with open('config.ini', 'w') as configfile:
+with open(name, 'w') as configfile:
   config.write(configfile)
-print("Configuration file 'config.ini' generated successfully.")
+print(f"Configuration file '{name}' generated successfully.")
